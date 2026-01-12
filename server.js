@@ -14,7 +14,7 @@ const STORE = process.env.SHOP_DOMAIN;
 const TOKEN = process.env.SHOP_ACCESS_TOKEN;
 const API_VERSION = process.env.API_VERSION;
 
-// Helper: Parse Shopify pagination link
+// Helper: just in case we ever need pagination again
 function getNextLink(linkHeader) {
   if (!linkHeader) return null;
   const match = linkHeader.match(/<([^>]+)>; rel="next"/);
@@ -27,56 +27,81 @@ function normalizeEmail(email) {
 }
 
 app.get("/giftcard", async (req, res) => {
-  const email = normalizeEmail(req.query.email);
+  const emailRaw = req.query.email || "";
+  const email = normalizeEmail(emailRaw);
 
-  if (!email) {
-    return res.status(400).json({ error: "Email missing" });
+  const customerId = req.query.customer_id
+    ? String(req.query.customer_id).trim()
+    : null;
+
+  if (!email && !customerId) {
+    return res.status(400).json({ error: "email or customer_id required" });
   }
 
   try {
-    let allGiftCards = [];
-    let url = `https://${STORE}/admin/api/${API_VERSION}/gift_cards.json?query=email:${encodeURIComponent(
-      email
-    )}&limit=50`;
-
-    while (url) {
-      const response = await fetch(url, {
-        method: "GET",
-        headers: {
-          "X-Shopify-Access-Token": TOKEN,
-          "Content-Type": "application/json",
-        },
-      });
-
-      if (!response.ok) {
-        const text = await response.text();
-        return res.status(response.status).json({
-          error: "Shopify request failed",
-          status: response.status,
-          details: text,
-        });
-      }
-
-      const data = await response.json();
-
-      if (data?.gift_cards?.length) {
-        allGiftCards.push(...data.gift_cards);
-      }
-
-      url = getNextLink(response.headers.get("link"));
-    }
-
-    // ✅ AUTO-FILTER HERE (no extra params needed)
-    // Example rules:
-    // - must have balance > 0
-    // - not disabled
-    // - not expired (if expires_on exists)
     const now = new Date();
 
-    const filteredGiftCards = allGiftCards.filter((gc) => {
+    // --------------------------------------
+    // 1) Build Shopify search query
+    // --------------------------------------
+    //
+    //  - Agar customer_id mila hua hai → SIRF usi par search:
+    //      customer_id:123456 AND status:enabled
+    //
+    //  - Warna email se search:
+    //      email:"user@email.com" AND status:enabled
+    //
+    //  -> is se Shopify seedha filtered result dega,
+    //     humen sari shop scan nahi karni.
+    // --------------------------------------
+    let queryParts = [];
+
+    if (customerId) {
+      queryParts.push(`customer_id:${customerId}`);
+    } else if (email) {
+      queryParts.push(`email:"${email}"`);
+    }
+
+    queryParts.push("status:enabled");
+
+    const searchQuery = queryParts.join(" AND ");
+
+    const url = `https://${STORE}/admin/api/${API_VERSION}/gift_cards/search.json?query=${encodeURIComponent(
+      searchQuery
+    )}&limit=250&fields=id,balance,initial_value,currency,customer_id,disabled_at,expires_on,created_at,updated_at`;
+
+    const response = await fetch(url, {
+      method: "GET",
+      headers: {
+        "X-Shopify-Access-Token": TOKEN,
+        "Content-Type": "application/json",
+      },
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      return res.status(response.status).json({
+        error: "Shopify request failed",
+        status: response.status,
+        details: text,
+      });
+    }
+
+    const data = await response.json();
+    let cards = Array.isArray(data?.gift_cards) ? data.gift_cards : [];
+
+    // --------------------------------------
+    // 2) Local filters (strict active only)
+    // --------------------------------------
+    //  - balance > 0
+    //  - disabled_at == null
+    //  - not expired
+    //  - agar customerId diya hai to phir bhi double check:
+    //      gc.customer_id == customerId
+    // --------------------------------------
+    cards = cards.filter((gc) => {
       const bal = parseFloat(gc.balance || "0");
       if (!(bal > 0)) return false;
-
       if (gc.disabled_at) return false;
 
       if (gc.expires_on) {
@@ -84,24 +109,28 @@ app.get("/giftcard", async (req, res) => {
         if (exp < now) return false;
       }
 
+      if (customerId) {
+        if (!gc.customer_id) return false;
+        if (String(gc.customer_id).trim() !== customerId) return false;
+      }
+
       return true;
     });
 
-    // Find customer_id (from filtered first, fallback to all)
-    const matchedCard =
-      filteredGiftCards.find((gc) => gc.customer_id !== null) ||
-      allGiftCards.find((gc) => gc.customer_id !== null);
+    const totalBalance = cards.reduce(
+      (sum, gc) => sum + parseFloat(gc.balance || "0"),
+      0
+    );
 
-    const customerId = matchedCard ? matchedCard.customer_id : null;
+    const finalCustomerId =
+      customerId ||
+      (cards.length && cards[0].customer_id
+        ? String(cards[0].customer_id).trim()
+        : null);
 
-    const totalBalance = filteredGiftCards.reduce((sum, gc) => {
-      return sum + parseFloat(gc.balance || "0");
-    }, 0);
-
-    // (Optional) return only fields you actually need
-    const slimCards = filteredGiftCards.map((gc) => ({
+    const slimCards = cards.map((gc) => ({
       id: gc.id,
-      code: gc.code, // note: depending on Shopify settings, code may be masked / restricted
+      code: gc.code, // note: code may be masked depending on Shopify settings
       balance: gc.balance,
       initial_value: gc.initial_value,
       currency: gc.currency,
@@ -114,12 +143,13 @@ app.get("/giftcard", async (req, res) => {
 
     return res.json({
       email,
-      customer_id: customerId,
+      customer_id: finalCustomerId,
       total_balance: totalBalance,
       gift_cards: slimCards,
       count: slimCards.length,
     });
   } catch (err) {
+    console.error("Giftcard API error:", err);
     return res.status(500).json({ error: err.message });
   }
 });
@@ -129,6 +159,7 @@ app.get("/", (req, res) => {
   res.send("Gift Card API Running ✔");
 });
 
-app.listen(process.env.PORT || 3000, () => {
-  console.log("Server running on port " + (process.env.PORT || 3000));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log("Server running on port " + PORT);
 });
