@@ -1,43 +1,20 @@
-import express from "express";
-import fetch from "node-fetch";
-import cors from "cors";
-import dotenv from "dotenv";
-
-dotenv.config();
-
-const app = express();
-app.use(cors());
-app.use(express.json());
-
-// ENV variables
-const STORE = process.env.SHOP_DOMAIN;
-const TOKEN = process.env.SHOP_ACCESS_TOKEN;
-const API_VERSION = process.env.API_VERSION;
-
-// Helper: Parse Shopify pagination link
-function getNextLink(linkHeader) {
-  if (!linkHeader) return null;
-  const match = linkHeader.match(/<([^>]+)>; rel="next"/);
-  return match ? match[1] : null;
-}
-
-// Helper: normalize email
-function normalizeEmail(email) {
-  return String(email || "").trim().toLowerCase();
-}
-
 app.get("/giftcard", async (req, res) => {
   const email = normalizeEmail(req.query.email);
+  const requestedCustomerId = req.query.customer_id
+    ? String(req.query.customer_id).trim()
+    : null;
 
-  if (!email) {
-    return res.status(400).json({ error: "Email missing" });
-  }
+  if (!email) return res.status(400).json({ error: "Email missing" });
 
   try {
     let allGiftCards = [];
-    let url = `https://${STORE}/admin/api/${API_VERSION}/gift_cards.json?query=email:${encodeURIComponent(
-      email
-    )}&limit=50`;
+
+    // ✅ IMPORTANT: use SEARCH endpoint (query works here)
+    const q = `email:${email}`;
+    let url = `https://${STORE}/admin/api/${API_VERSION}/gift_cards/search.json` +
+      `?query=${encodeURIComponent(q)}` +
+      `&limit=250` +
+      `&fields=id,balance,currency,customer_id,disabled_at,expires_on,created_at,updated_at`;
 
     while (url) {
       const response = await fetch(url, {
@@ -58,77 +35,46 @@ app.get("/giftcard", async (req, res) => {
       }
 
       const data = await response.json();
-
-      if (data?.gift_cards?.length) {
-        allGiftCards.push(...data.gift_cards);
-      }
+      if (data?.gift_cards?.length) allGiftCards.push(...data.gift_cards);
 
       url = getNextLink(response.headers.get("link"));
     }
 
-    // ✅ AUTO-FILTER HERE (no extra params needed)
-    // Example rules:
-    // - must have balance > 0
-    // - not disabled
-    // - not expired (if expires_on exists)
     const now = new Date();
 
-    const filteredGiftCards = allGiftCards.filter((gc) => {
+    // same rules as your code, but server-side
+    let filteredGiftCards = allGiftCards.filter((gc) => {
       const bal = parseFloat(gc.balance || "0");
       if (!(bal > 0)) return false;
-
       if (gc.disabled_at) return false;
 
       if (gc.expires_on) {
         const exp = new Date(gc.expires_on);
         if (exp < now) return false;
       }
-
       return true;
     });
 
-    // Find customer_id (from filtered first, fallback to all)
-    const matchedCard =
-      filteredGiftCards.find((gc) => gc.customer_id !== null) ||
-      allGiftCards.find((gc) => gc.customer_id !== null);
+    // ✅ If customer_id provided → return ONLY that customer's cards
+    if (requestedCustomerId) {
+      filteredGiftCards = filteredGiftCards.filter(
+        (gc) => String(gc.customer_id || "").trim() === requestedCustomerId
+      );
+    }
 
-    const customerId = matchedCard ? matchedCard.customer_id : null;
-
-    const totalBalance = filteredGiftCards.reduce((sum, gc) => {
-      return sum + parseFloat(gc.balance || "0");
-    }, 0);
-
-    // (Optional) return only fields you actually need
-    const slimCards = filteredGiftCards.map((gc) => ({
-      id: gc.id,
-      code: gc.code, // note: depending on Shopify settings, code may be masked / restricted
-      balance: gc.balance,
-      initial_value: gc.initial_value,
-      currency: gc.currency,
-      customer_id: gc.customer_id,
-      disabled_at: gc.disabled_at,
-      expires_on: gc.expires_on,
-      created_at: gc.created_at,
-      updated_at: gc.updated_at,
-    }));
+    const totalBalance = filteredGiftCards.reduce(
+      (sum, gc) => sum + parseFloat(gc.balance || "0"),
+      0
+    );
 
     return res.json({
       email,
-      customer_id: customerId,
+      customer_id: requestedCustomerId || null,
       total_balance: totalBalance,
-      gift_cards: slimCards,
-      count: slimCards.length,
+      gift_cards: filteredGiftCards,
+      count: filteredGiftCards.length,
     });
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
-});
-
-// HOME ROUTE
-app.get("/", (req, res) => {
-  res.send("Gift Card API Running ✔");
-});
-
-app.listen(process.env.PORT || 3000, () => {
-  console.log("Server running on port " + (process.env.PORT || 3000));
 });
